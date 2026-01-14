@@ -1,0 +1,5 @@
+numpy
+tiktoken
+tqdm
+requests
+datasets
