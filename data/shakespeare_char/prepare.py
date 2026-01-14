@@ -11,75 +11,68 @@ import requests
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from utils import parse_args, setup_output_dir
+from utils import parse_args, check_and_setup, copy_to_nfs
 
 
 if __name__ == '__main__':
     args = parse_args('Prepare Shakespeare char-level dataset')
-    output_dir = setup_output_dir('shakespeare_char', args.force, extra_files=['meta.pkl'])
     
-    if output_dir is None:
+    # Check NFS first, then local - if files exist, we're done
+    result = check_and_setup('shakespeare_char', args.force, ['train.bin', 'val.bin', 'meta.pkl'])
+    if result is None:
         exit(0)
-
-    # download the tiny shakespeare dataset
-    input_file_path = os.path.join(output_dir, 'input.txt')
+    
+    # Files don't exist - need to process
+    local_dir, nfs_dir = result
+    
+    input_file_path = os.path.join(local_dir, 'input.txt')
     if not os.path.exists(input_file_path) or args.force:
+        print("Downloading...")
         data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-        print("Downloading Shakespeare dataset...")
         with open(input_file_path, 'w') as f:
             f.write(requests.get(data_url).text)
-
+    
     with open(input_file_path, 'r') as f:
         data = f.read()
-    print(f"length of dataset in characters: {len(data):,}")
-
-    # get all the unique characters that occur in this text
+    
+    print("Creating vocabulary...")
     chars = sorted(list(set(data)))
     vocab_size = len(chars)
-    print("all the unique characters:", ''.join(chars))
-    print(f"vocab size: {vocab_size:,}")
-
-    # create a mapping from characters to integers
+    print(f"vocab size: {vocab_size}, chars: {''.join(chars)}")
+    
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for i, ch in enumerate(chars)}
-
+    
     def encode(s):
-        return [stoi[c] for c in s]  # encoder: take a string, output a list of integers
-
+        return [stoi[c] for c in s]
+    
     def decode(l):
-        return ''.join([itos[i] for i in l])  # decoder: take a list of integers, output a string
-
-    # create the train and test splits
+        return ''.join([itos[i] for i in l])
+    
     n = len(data)
     train_data = data[:int(n*0.9)]
     val_data = data[int(n*0.9):]
-
-    # encode both to integers
+    
     train_ids = encode(train_data)
     val_ids = encode(val_data)
-    print(f"train has {len(train_ids):,} tokens")
-    print(f"val has {len(val_ids):,} tokens")
-
-    # export to bin files
+    print(f"train: {len(train_ids):,} tokens, val: {len(val_ids):,} tokens")
+    
+    print("Writing bin files...")
     train_ids = np.array(train_ids, dtype=np.uint16)
     val_ids = np.array(val_ids, dtype=np.uint16)
-    train_ids.tofile(os.path.join(output_dir, 'train.bin'))
-    val_ids.tofile(os.path.join(output_dir, 'val.bin'))
-
-    # save the meta information as well, to help us encode/decode later
+    train_ids.tofile(os.path.join(local_dir, 'train.bin'))
+    val_ids.tofile(os.path.join(local_dir, 'val.bin'))
+    
     meta = {
         'vocab_size': vocab_size,
         'itos': itos,
         'stoi': stoi,
     }
-    with open(os.path.join(output_dir, 'meta.pkl'), 'wb') as f:
+    with open(os.path.join(local_dir, 'meta.pkl'), 'wb') as f:
         pickle.dump(meta, f)
-
-    print("Done!")
-
-    # length of dataset in characters:  1115394
-    # all the unique characters:
-    #  !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
-    # vocab size: 65
-    # train has 1003854 tokens
-    # val has 111540 tokens
+    
+    if nfs_dir:
+        print("Copying to NFS...")
+        copy_to_nfs(local_dir, nfs_dir, ['train.bin', 'val.bin', 'meta.pkl'])
+    
+    print(f"Done! Files in {local_dir}")

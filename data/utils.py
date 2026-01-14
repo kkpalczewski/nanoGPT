@@ -1,30 +1,49 @@
 """Common utilities for dataset preparation scripts."""
 import os
+import subprocess
 import argparse
+from dotenv import load_dotenv
 
 
-def get_output_dir(dataset_name: str) -> str:
-    """Get output directory from LAMBDA_SHARED_STORAGE env var or fallback to local."""
+def get_local_dir(dataset_name: str) -> str:
+    """Get local data directory."""
+    return os.path.join('data', dataset_name)
+
+
+def get_nfs_dir(dataset_name: str) -> str:
+    """Get NFS directory from LAMBDA_SHARED_STORAGE."""
+    load_dotenv()
     shared_storage = os.environ.get('LAMBDA_SHARED_STORAGE')
     if shared_storage:
         return os.path.join(shared_storage, dataset_name)
-    return os.path.join(os.path.dirname(__file__), dataset_name)
+    return None
 
 
-def files_exist(output_dir: str, files: list[str] = None) -> bool:
-    """Check if required files already exist in output directory."""
-    if files is None:
-        files = ['train.bin', 'val.bin']
+def files_exist(output_dir: str, files: list[str]) -> bool:
+    """Check if required files exist in output directory."""
+    if not output_dir or not os.path.exists(output_dir):
+        return False
     return all(os.path.exists(os.path.join(output_dir, f)) for f in files)
 
 
-def remove_files(output_dir: str, files: list[str]) -> None:
-    """Remove specified files from output directory if they exist."""
+def copy_from_nfs(nfs_dir: str, local_dir: str, files: list[str]) -> None:
+    """Copy files from NFS to local using rsync."""
+    os.makedirs(local_dir, exist_ok=True)
     for f in files:
-        path = os.path.join(output_dir, f)
-        if os.path.exists(path):
-            os.remove(path)
-            print(f"Removed {path}")
+        src = os.path.join(nfs_dir, f)
+        if os.path.exists(src):
+            dst = os.path.join(local_dir, f)
+            subprocess.run(['rsync', '-az', '--progress', src, dst], check=True)
+
+
+def copy_to_nfs(local_dir: str, nfs_dir: str, files: list[str]) -> None:
+    """Copy files from local to NFS using rsync."""
+    os.makedirs(nfs_dir, exist_ok=True)
+    for f in files:
+        src = os.path.join(local_dir, f)
+        if os.path.exists(src):
+            dst = os.path.join(nfs_dir, f)
+            subprocess.run(['rsync', '-az', '--progress', src, dst], check=True)
 
 
 def parse_args(description: str) -> argparse.Namespace:
@@ -35,26 +54,36 @@ def parse_args(description: str) -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_output_dir(dataset_name: str, force: bool, extra_files: list[str] = None) -> str | None:
+def check_and_setup(dataset_name: str, force: bool, required_files: list[str]) -> tuple[str, str] | None:
     """
-    Setup output directory and check if processing is needed.
+    Check if files exist (local first, then NFS), setup directories.
     
-    Returns output_dir if processing should proceed, None if files exist and force=False.
+    Returns (local_dir, nfs_dir) if processing needed, None if files already exist.
     """
-    output_dir = get_output_dir(dataset_name)
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Output directory: {output_dir}")
-
-    files_to_check = ['train.bin', 'val.bin']
-    if extra_files:
-        files_to_check.extend(extra_files)
-
-    if files_exist(output_dir) and not force:
-        print("train.bin and val.bin already exist. Use --force to re-process.")
+    local_dir = get_local_dir(dataset_name)
+    nfs_dir = get_nfs_dir(dataset_name)
+    
+    # Check if files already exist locally
+    if files_exist(local_dir, required_files) and not force:
+        print(f"Files already exist in {local_dir}")
         return None
-
-    if force and files_exist(output_dir):
-        print("Force flag set. Removing existing files...")
-        remove_files(output_dir, files_to_check)
-
-    return output_dir
+    
+    # Check NFS - if files exist there, copy to local
+    if nfs_dir and files_exist(nfs_dir, required_files) and not force:
+        print(f"Files found on NFS, copying to local...")
+        copy_from_nfs(nfs_dir, local_dir, required_files)
+        return None
+    
+    # Files don't exist - need to process
+    if force:
+        print("Force flag set, will re-process")
+        for f in required_files:
+            path = os.path.join(local_dir, f)
+            if os.path.exists(path):
+                os.remove(path)
+            if nfs_dir:
+                path = os.path.join(nfs_dir, f)
+                if os.path.exists(path):
+                    os.remove(path)
+    os.makedirs(local_dir, exist_ok=True)
+    return local_dir, nfs_dir

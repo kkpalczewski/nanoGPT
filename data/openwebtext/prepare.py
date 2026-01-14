@@ -9,7 +9,7 @@ import tiktoken
 from datasets import load_dataset  # huggingface datasets
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from utils import parse_args, setup_output_dir
+from utils import parse_args, check_and_setup, copy_to_nfs
 
 # number of workers in .map() call
 # good number to use is ~order number of cpu cores // 2
@@ -25,70 +25,52 @@ enc = tiktoken.get_encoding("gpt2")
 
 if __name__ == '__main__':
     args = parse_args('Prepare OpenWebText dataset')
-    output_dir = setup_output_dir('openwebtext', args.force)
     
-    if output_dir is None:
+    # Check NFS first, then local - if files exist, we're done
+    result = check_and_setup('openwebtext', args.force, ['train.bin', 'val.bin'])
+    if result is None:
         exit(0)
-
-    # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
+    
+    # Files don't exist - need to process
+    local_dir, nfs_dir = result
+    
+    print("Downloading dataset...")
     dataset = load_dataset("openwebtext", num_proc=num_proc_load_dataset)
-
-    # owt by default only contains the 'train' split, so create a test split
+    
     split_dataset = dataset["train"].train_test_split(test_size=0.0005, seed=2357, shuffle=True)
-    split_dataset['val'] = split_dataset.pop('test')  # rename the test split to val
-
-    # this results in:
-    # >>> split_dataset
-    # DatasetDict({
-    #     train: Dataset({
-    #         features: ['text'],
-    #         num_rows: 8009762
-    #     })
-    #     val: Dataset({
-    #         features: ['text'],
-    #         num_rows: 4007
-    #     })
-    # })
-
-    # we now want to tokenize the dataset. first define the encoding function (gpt2 bpe)
+    split_dataset['val'] = split_dataset.pop('test')
+    
     def process(example):
-        ids = enc.encode_ordinary(example['text'])  # encode_ordinary ignores any special tokens
-        ids.append(enc.eot_token)  # add the end of text token, e.g. 50256 for gpt2 bpe
-        # note: I think eot should be prepended not appended... hmm. it's called "eot" though...
-        out = {'ids': ids, 'len': len(ids)}
-        return out
-
-    # tokenize the dataset
+        ids = enc.encode_ordinary(example['text'])
+        ids.append(enc.eot_token)
+        return {'ids': ids, 'len': len(ids)}
+    
+    print("Tokenizing...")
     tokenized = split_dataset.map(
         process,
         remove_columns=['text'],
-        desc="tokenizing the splits",
+        desc="tokenizing",
         num_proc=num_proc,
     )
-
-    # concatenate all the ids in each dataset into one large file we can use for training
+    
+    print("Writing bin files...")
     for split, dset in tokenized.items():
         arr_len = np.sum(dset['len'], dtype=np.uint64)
-        filename = os.path.join(output_dir, f'{split}.bin')
-        dtype = np.uint16  # (can do since enc.max_token_value == 50256 is < 2**16)
+        filename = os.path.join(local_dir, f'{split}.bin')
+        dtype = np.uint16
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
         total_batches = 1024
-
+        
         idx = 0
-        for batch_idx in tqdm(range(total_batches), desc=f'writing {filename}'):
-            # Batch together samples for faster write
+        for batch_idx in tqdm(range(total_batches), desc=f'{split}.bin'):
             batch = dset.shard(num_shards=total_batches, index=batch_idx, contiguous=True).with_format('numpy')
             arr_batch = np.concatenate(batch['ids'])
-            # Write into mmap
             arr[idx: idx + len(arr_batch)] = arr_batch
             idx += len(arr_batch)
         arr.flush()
-
-    print("Done!")
-
-    # train.bin is ~17GB, val.bin ~8.5MB
-    # train has ~9B tokens (9,035,582,198)
-    # val has ~4M tokens (4,434,897)
-
-    # to read the bin files later, e.g. with numpy:
-    # m = np.memmap('train.bin', dtype=np.uint16, mode='r')
+    
+    if nfs_dir:
+        print("Copying to NFS...")
+        copy_to_nfs(local_dir, nfs_dir, ['train.bin', 'val.bin'])
+    
+    print(f"Done! Files in {local_dir}")

@@ -20,6 +20,8 @@ import os
 import time
 import math
 import pickle
+import subprocess
+import threading
 from contextlib import nullcontext
 
 import numpy as np
@@ -32,7 +34,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
+out_dir = 'out'  # local output directory (will async copy to NFS)
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -40,7 +42,7 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
@@ -101,8 +103,12 @@ else:
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
+# Setup NFS output directory for async copying
+nfs_out_dir = os.path.join(os.environ.get("LAMBDA_SHARED_STORAGE") or '', 'out') if os.environ.get("LAMBDA_SHARED_STORAGE") else None
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    if nfs_out_dir:
+        os.makedirs(nfs_out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -113,6 +119,8 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+if not os.path.exists(os.path.join(data_dir, 'train.bin')):
+    raise FileNotFoundError(f"Data not found in {data_dir}. Run prepare script first (e.g. python data/{dataset}/prepare.py)")
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -283,7 +291,16 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+                torch.save(checkpoint, ckpt_path)
+                # Async copy to NFS if available using rsync
+                if nfs_out_dir and master_process:
+                    def copy_checkpoint():
+                        try:
+                            subprocess.run(['rsync', '-az', ckpt_path, f'{nfs_out_dir}/'], check=False)
+                        except Exception as e:
+                            print(f"Warning: Failed to copy checkpoint to NFS: {e}")
+                    threading.Thread(target=copy_checkpoint, daemon=True).start()
     if iter_num == 0 and eval_only:
         break
 

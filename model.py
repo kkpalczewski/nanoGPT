@@ -209,7 +209,10 @@ class GPT(nn.Module):
         override_args = override_args or {} # default to empty dict
         # only dropout can be overridden see more notes below
         assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
+        try:
+            from transformers import GPT2LMHeadModel
+        except ImportError:
+            from transformers.models.gpt2 import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
         # n_layer, n_head and n_embd are determined from model_type

@@ -3,3 +3,6 @@ tiktoken
 tqdm
 requests
 datasets
+python-dotenv
+wandb
+transformers
