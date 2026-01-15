@@ -341,7 +341,19 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        eta_hours = (max_iters - iter_num) * dt / 3600 if dt > 0 else 0
+        print(f"iter {iter_num}/{max_iters}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, eta {eta_hours:.1f}h")
+        if wandb_log:
+            tokens_per_sec = tokens_per_iter / dt if dt > 0 else 0
+            us_per_token = (dt * 1e6) / tokens_per_iter if tokens_per_iter > 0 else 0  # microseconds per token
+            wandb.log({
+                "iter": iter_num,
+                "train/loss_step": lossf,
+                "time_ms": dt * 1000,
+                "tokens_per_sec": tokens_per_sec,
+                "us_per_token": us_per_token,  # comparable across configs
+                "mfu": running_mfu * 100,
+            })
     iter_num += 1
     local_iter_num += 1
 
