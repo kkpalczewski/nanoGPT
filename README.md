@@ -131,6 +131,35 @@ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.4
 
 It is a good idea to benchmark your interconnect (e.g. iperf3). In particular, if you don't have Infiniband then also prepend `NCCL_IB_DISABLE=1` to the above launches. Your multinode training will work, but most likely _crawl_. By default checkpoints are periodically written to the `--out_dir`. We can sample from the model by simply `python sample.py`.
 
+**Multi-node on cloud instances (Lambda Labs, etc.):**
+
+Cloud instances often have hostname resolution issues. Run `./setup.sh` on each node to get the `/etc/hosts` entry, then add entries for ALL nodes to `/etc/hosts` on EACH node:
+
+```bash
+# Example /etc/hosts entries (use private IPs from setup.sh output)
+10.19.89.48   150-136-220-59
+10.19.82.249  150-136-43-139
+```
+
+Set environment variables and use the rendezvous backend:
+
+```bash
+export NCCL_SOCKET_IFNAME=eno1  # your NIC name
+export GLOO_SOCKET_IFNAME=eno1
+export NCCL_SOCKET_FAMILY=AF_INET
+export GLOO_SOCKET_FAMILY=AF_INET
+
+# Node 0 (use private IP of node 0 as master)
+torchrun --nnodes=2 --nproc_per_node=1 --node_rank=0 \
+    --rdzv_backend=c10d --rdzv_endpoint=10.19.89.48:29500 --rdzv_id=nanogpt \
+    train.py
+
+# Node 1
+torchrun --nnodes=2 --nproc_per_node=1 --node_rank=1 \
+    --rdzv_backend=c10d --rdzv_endpoint=10.19.89.48:29500 --rdzv_id=nanogpt \
+    train.py
+```
+
 Finally, to train on a single GPU simply run the `python train.py` script. Have a look at all of its args, the script tries to be very readable, hackable and transparent. You'll most likely want to tune a number of those variables depending on your needs.
 
 ## baselines

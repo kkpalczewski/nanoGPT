@@ -15,3 +15,10 @@ if [ "$1" == "--data" ]; then
     python data/shakespeare_char/prepare.py
     python data/openwebtext/prepare.py
 fi
+
+# Print node info for multi-node setup
+echo ""
+echo "=== Node info (for multi-node training) ==="
+echo "Hostname: $(hostname)"
+echo "Private IP: $(hostname -I | awk '{print $1}')"
+echo "/etc/hosts entry: $(hostname -I | awk '{print $1}')   $(hostname)"
