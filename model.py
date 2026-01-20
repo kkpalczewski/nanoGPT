@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from tkinter import N
 
 import torch
 import torch.nn as nn
@@ -28,9 +29,17 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, disable_flash=False):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.config = config
+        if config.pos_embed == "alibi":
+            # ALiBi slopes: one per head, shape (n_head, 1, 1) for broadcasting
+            # Standard formula: 2^(-8/n_head * i) for head i in [1, n_head]
+            head_indices = torch.arange(1, config.n_head + 1, dtype=torch.float32)
+            slopes = torch.pow(2, -8.0 / config.n_head * head_indices)
+            self.register_buffer('alibi_slopes', slopes.view(config.n_head, 1, 1), persistent=False)
+            
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -42,7 +51,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and not disable_flash
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -63,8 +72,15 @@ class CausalSelfAttention(nn.Module):
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
-            # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if self.config.pos_embed == 'alibi':
+                # relative distance: distance[i,j] = j - i (negative for looking back)
+                # shape: (T, T)
+                positions = torch.arange(T, device=att.device)
+                relative_dist = positions.view(1, -1) - positions.view(-1, 1)  # (T, T)
+                # ALiBi bias: slopes * distance, broadcast to (1, n_head, T, T)
+                alibi_bias = self.alibi_slopes * relative_dist.unsqueeze(0)  # (n_head, T, T)
+                att = att + alibi_bias.unsqueeze(0)  # (B, n_head, T, T)
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
@@ -96,7 +112,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, disable_flash=config.disable_flash)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -114,6 +130,31 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    pos_embed: str = "learned" # learned, sinusoidal, alibi
+    float_dtype: str = "float16" # needed for buffers
+    disable_flash: bool = False
+
+def compute_sinusoidal_embeddings(n_embed, block_size, dtype=torch.float32):
+    """Compute fixed sinusoidal positional embeddings (not learnable)."""
+    sin_i_index = torch.arange(n_embed//2, dtype=dtype)
+    cos_i_index = torch.arange(n_embed//2, dtype=dtype)+1
+
+    sin_exp = sin_i_index/n_embed
+    cos_exp = cos_i_index/n_embed
+
+    sin_base = torch.pow(10000, sin_exp)
+    cos_base = torch.pow(10000, cos_exp)
+
+    emb_var_part = torch.stack((sin_base, cos_base), dim=1).reshape(-1).expand(block_size, n_embed)
+    pos_var_part = torch.arange(block_size, dtype=dtype).unsqueeze(1).expand(block_size, n_embed)
+
+    embed_base = pos_var_part/emb_var_part
+
+    pos_embed = torch.zeros_like(embed_base)
+    pos_embed[:, 0::2] = torch.sin(embed_base[:, 0::2])
+    pos_embed[:, 1::2] = torch.cos(embed_base[:, 1::2])
+
+    return pos_embed
 
 class GPT(nn.Module):
 
@@ -125,11 +166,24 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        
+        # positional embeddings: either learnable (nn.Embedding) or fixed (buffer)
+        if config.pos_embed == "learned":
+            self.transformer.wpe = nn.Embedding(config.block_size, config.n_embd)
+        elif config.pos_embed == "sinusoidal":
+            # fixed sinusoidal embeddings - register as buffer, NOT a parameter
+            dtype = getattr(torch, config.float_dtype) if isinstance(config.float_dtype, str) else config.float_dtype
+            pe = compute_sinusoidal_embeddings(config.n_embd, config.block_size, dtype)
+            self.register_buffer('_wpe', pe, persistent=True)
+        elif config.pos_embed == "alibi":
+            pass
+        else:
+            raise ValueError(f"Unknown pos_embed type: {config.pos_embed}")
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -147,6 +201,16 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    @property
+    def wpe_weight(self):
+        """Uniform access to positional embedding weights (learned or fixed)."""
+        if self.config.pos_embed == "alibi":
+            return None
+        if hasattr(self.transformer, 'wpe'):
+            return self.transformer.wpe.weight
+        else:  # sinusoidal buffer
+            return self._wpe
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -155,7 +219,8 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
+        if non_embedding and hasattr(self.transformer, 'wpe'):
+            # only subtract if wpe is learnable (sinusoidal is a buffer, not in parameters())
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
@@ -171,12 +236,17 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
+        
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        if self.config.pos_embed != "alibi":
+            pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+            pos_emb = self.wpe_weight[pos] # position embeddings of shape (t, n_embd)
+            tok_pos_emb = tok_emb + pos_emb
+        else:
+            tok_pos_emb = tok_emb
+
+        x = self.transformer.drop(tok_pos_emb)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -198,7 +268,13 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+
+        if self.config.pos_embed != "alibi":
+            if hasattr(self.transformer, 'wpe'):
+                self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+            else:  # sinusoidal buffer
+                self._wpe = self._wpe[:block_size]
+
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
@@ -269,9 +345,16 @@ class GPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        all_params = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        param_dict = {pn: p for pn, p in all_params.items() if p.requires_grad}
+        frozen_params = {pn: p for pn, p in all_params.items() if not p.requires_grad}
+        
+        # print trainable vs frozen parameters
+        print(f"trainable parameters ({len(param_dict)}): {list(param_dict.keys())}")
+        if frozen_params:
+            print(f"frozen parameters ({len(frozen_params)}): {list(frozen_params.keys())}")
+        
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]

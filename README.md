@@ -123,10 +123,10 @@ This will run for about 4 days using PyTorch Distributed Data Parallel (DDP) and
 If you're in a cluster environment and you are blessed with multiple GPU nodes you can make GPU go brrrr e.g. across 2 nodes like:
 
 ```sh
-# Run on the first (master) node with example IP 123.456.123.456:
-torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-# Run on the worker node:
-torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
+# Run on master node (use master's private IP, e.g. from `hostname -I`):
+torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=10.0.0.1 --master_port=1234 train.py
+# Run on worker node (same master IP):
+torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=10.0.0.1 --master_port=1234 train.py
 ```
 
 It is a good idea to benchmark your interconnect (e.g. iperf3). In particular, if you don't have Infiniband then also prepend `NCCL_IB_DISABLE=1` to the above launches. Your multinode training will work, but most likely _crawl_. By default checkpoints are periodically written to the `--out_dir`. We can sample from the model by simply `python sample.py`.
@@ -136,9 +136,14 @@ It is a good idea to benchmark your interconnect (e.g. iperf3). In particular, i
 Cloud instances often have hostname resolution issues. Run `./setup.sh` on each node to get the `/etc/hosts` entry, then add entries for ALL nodes to `/etc/hosts` on EACH node:
 
 ```bash
-# Example /etc/hosts entries (use private IPs from setup.sh output)
-10.19.89.48   150-136-220-59
-10.19.82.249  150-136-43-139
+# Get values for /etc/hosts on each node:
+hostname          # e.g. 150-136-220-59
+hostname -I       # e.g. 10.19.89.48 (private IP)
+
+# Add entries for ALL nodes to /etc/hosts on EACH node:
+sudo nano /etc/hosts
+# 10.19.89.48   150-136-220-59
+# 10.19.82.249  150-136-43-139
 ```
 
 Set environment variables and use the rendezvous backend:

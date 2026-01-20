@@ -74,6 +74,9 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
+pos_embed = 'learned'
+disable_flash = False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -153,7 +156,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, float_dtype=dtype, pos_embed=pos_embed, disable_flash=disable_flash) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -341,19 +344,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        eta_hours = (max_iters - iter_num) * dt / 3600 if dt > 0 else 0
-        print(f"iter {iter_num}/{max_iters}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, eta {eta_hours:.1f}h")
-        if wandb_log:
-            tokens_per_sec = tokens_per_iter / dt if dt > 0 else 0
-            us_per_token = (dt * 1e6) / tokens_per_iter if tokens_per_iter > 0 else 0  # microseconds per token
-            wandb.log({
-                "iter": iter_num,
-                "train/loss_step": lossf,
-                "time_ms": dt * 1000,
-                "tokens_per_sec": tokens_per_sec,
-                "us_per_token": us_per_token,  # comparable across configs
-                "mfu": running_mfu * 100,
-            })
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
